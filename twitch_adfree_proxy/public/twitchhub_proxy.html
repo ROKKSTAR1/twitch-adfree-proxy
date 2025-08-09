@@ -12,7 +12,7 @@
   input{background:#101319;border:1px solid #262a33;border-radius:10px;color:#fff;padding:10px 12px;min-width:220px}
   button{background:#9146FF;border:none;color:#fff;border-radius:10px;padding:10px 12px;font-weight:700;cursor:pointer}
   button:hover{background:#772ce8}
-  #video{width:100%;max-height:70vh;background:#000}
+  #video{width:100%;max-height:70vh;background:#000;border-radius:10px}
   .small{font-size:12px;color:#cbd5e1}
 </style>
 </head>
@@ -25,37 +25,43 @@
   </div>
   <video id="video" controls autoplay playsinline></video>
   <div class="small">
-    This demo plays video only (no chat). You can keep your older page for chat or embed Twitch chat separately:<br>
-    <code>&lt;iframe src="https://www.twitch.tv/embed/CHANNEL/chat?parent=YOURDOMAIN"&gt;&lt;/iframe&gt;</code>
+    If it stalls, wait ~30s on first load (free hosting “wakes up”). Try another channel to test.
   </div>
 </div>
 
-<!-- hls.js from CDN -->
 <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
 <script>
 const playBtn = document.getElementById('play');
 const channel = document.getElementById('channel');
 const video = document.getElementById('video');
 
-function play(){
+// read channel from URL hash (so your hub can deep-link like /twitchhub_proxy.html#pokimane)
+const initial = decodeURIComponent((location.hash || '').replace(/^#/, ''));
+if (initial) channel.value = initial;
+
+async function play(){
   const ch = (channel.value || '').trim().toLowerCase();
   if(!ch){ alert('Type a channel login'); return; }
   const playlist = `${location.origin}/playlist/${encodeURIComponent(ch)}`;
-  if(Hls.isSupported()){
+
+  if (window.Hls && Hls.isSupported()) {
     const hls = new Hls({ lowLatencyMode: true, backBufferLength: 60 });
     hls.loadSource(playlist);
     hls.attachMedia(video);
     hls.on(Hls.Events.ERROR, (evt, data) => {
       console.error('HLS error', data);
     });
-  }else if(video.canPlayType('application/vnd.apple.mpegurl')){
+  } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
     video.src = playlist;
-  }else{
+  } else {
     alert('HLS not supported in this browser.');
   }
 }
 
 playBtn.addEventListener('click', play);
+
+// Auto-play if we got a channel from the hash
+if (initial) { setTimeout(play, 10); }
 </script>
 </body>
 </html>
