@@ -1,16 +1,15 @@
+// server.js (Render / Node 18+)
+// Purpose: fetch Twitch HLS, remove ad markers, proxy all URLs, add better logging.
+
 import express from 'express';
 
-// ⚠️ Educational demo. Twitch can change things at any time.
-// Use your own Client-ID from https://dev.twitch.tv/console/apps if possible.
 const TWITCH_GQL = 'https://gql.twitch.tv/gql';
 const USHER = 'https://usher.ttvnw.net/api/channel/hls';
-const CLIENT_ID = process.env.TWITCH_CLIENT_ID || 'kimne78kx3ncx6brgo4mv6wki5h1ko'; // fallback public client id (may break anytime)
+const CLIENT_ID = process.env.TWITCH_CLIENT_ID || 'kimne78kx3ncx6brgo4mv6wki5h1ko'; // fallback public client id
 
 const app = express();
 
-app.get('/health', (req, res) => res.type('text').send('ok'));
-
-// Small CORS helper so your iPhone can call this from your hosted page
+// CORS so iPhone Safari can fetch from your domain
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -19,116 +18,134 @@ app.use((req, res, next) => {
   next();
 });
 
-// 1) Get a clean HLS playlist for a channel and strip ad segments
-app.get('/playlist/:channel', async (req, res) => {
-  try{
-    const login = String(req.params.channel || '').toLowerCase();
-    if(!/^[a-z0-9_]{1,25}$/.test(login)) return res.status(400).send('bad channel');
+app.get('/health', (req, res) => res.type('text').send('ok'));
 
-    // Step A: fetch access token/signature via GQL
-    const body = [{
-      operationName: "PlaybackAccessToken",
-      variables: { isLive: true, login, isVod: false, vodID: "", playerType: "site" },
-      extensions: {
-        persistedQuery: {
-          version: 1,
-          sha256Hash: "0828119ded1c1323e9f9f8f9ccf0c9d2d2cfa2b7066ad9e3f1ab3d0d7f6f6f0a"
-        }
+// Helper: ask Twitch GraphQL for a playback token/signature
+async function getPlaybackToken(login) {
+  // Primary persisted query (commonly used by web player)
+  const body = [{
+    operationName: 'PlaybackAccessToken',
+    variables: { isLive: true, login, isVod: false, vodID: '', playerType: 'site' },
+    extensions: {
+      persistedQuery: {
+        version: 1,
+        // NOTE: Twitch can rotate this. This one works frequently; if it stops, we try a fallback below.
+        sha256Hash: '0828119ded1c1323e9f9f8f9ccf0c9d2d2cfa2b7066ad9e3f1ab3d0d7f6f6f0a'
       }
-    }];
-    const gql = await fetch(TWITCH_GQL, {
-      method: 'POST',
-      headers: { 'Client-ID': CLIENT_ID, 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    });
-    if(!gql.ok) return res.status(500).send('gql failed');
-    const data = await gql.json();
-    const tok = data?.[0]?.data?.streamPlaybackAccessToken;
-    if(!tok?.signature || !tok?.value) return res.status(404).send('no token');
+    }
+  }];
 
-    // Step B: fetch HLS master m3u8 from Usher
+  const h = { 'Client-ID': CLIENT_ID, 'Content-Type': 'application/json' };
+  let r = await fetch(TWITCH_GQL, { method: 'POST', headers: h, body: JSON.stringify(body) });
+
+  // If first attempt fails, try a slightly different playerType (fallback)
+  if (!r.ok) {
+    console.warn('GQL primary failed:', r.status);
+    const fb = [{
+      operationName: 'PlaybackAccessToken',
+      variables: { isLive: true, login, isVod: false, vodID: '', playerType: 'embed' },
+      extensions: body[0].extensions
+    }];
+    r = await fetch(TWITCH_GQL, { method: 'POST', headers: h, body: JSON.stringify(fb) });
+  }
+  if (!r.ok) throw new Error('gql_failed_' + r.status);
+
+  const j = await r.json();
+  const tok = j?.[0]?.data?.streamPlaybackAccessToken;
+  if (!tok?.signature || !tok?.value) throw new Error('no_token');
+  return tok;
+}
+
+// 1) Return a cleaned master playlist for a channel
+app.get('/playlist/:channel', async (req, res) => {
+  try {
+    const login = String(req.params.channel || '').toLowerCase();
+    if (!/^[a-z0-9_]{1,25}$/.test(login)) return res.status(400).type('text').send('bad_channel');
+
+    // A) token+sig
+    const tok = await getPlaybackToken(login);
+
+    // B) fetch Usher master playlist
     const url = new URL(`${USHER}/${encodeURIComponent(login)}.m3u8`);
     url.searchParams.set('sig', tok.signature);
     url.searchParams.set('token', tok.value);
     url.searchParams.set('allow_source', 'true');
     url.searchParams.set('allow_audio_only', 'true');
     url.searchParams.set('player', 'twitchweb');
-    url.searchParams.set('p', String(Math.floor(Math.random()*1e7)));
+    url.searchParams.set('p', String(Math.floor(Math.random() * 1e7)));
     url.searchParams.set('client_id', CLIENT_ID);
 
-    const m3u8Resp = await fetch(url, { headers: { 'Client-ID': CLIENT_ID } });
-    if(!m3u8Resp.ok) return res.status(500).send('usher failed');
-    let text = await m3u8Resp.text();
+    const up = await fetch(url, { headers: { 'Client-ID': CLIENT_ID } });
+    if (!up.ok) throw new Error('usher_failed_' + up.status);
+    let text = await up.text();
 
-    // Step C: rewrite segment URIs through our /segment proxy and strip any ad dateranges
-    // - Remove ad dateranges (common markers: CLASS="stitched-ad" or "TwitchAd")
+    // C) strip common ad dateranges
     text = text.split('\n').filter(line => {
-      if(line.startsWith('#EXT-X-DATERANGE')){
+      if (line.startsWith('#EXT-X-DATERANGE')) {
         const l = line.toLowerCase();
-        if(l.includes('stitched-ad') || l.includes('twitchad')){
-          return false; // drop ad markers
-        }
+        if (l.includes('stitched-ad') || l.includes('twitchad')) return false;
       }
       return true;
     }).join('\n');
 
-    // Also when returning a master playlist with variant URLs, we need to proxy those too
-    const proxied = text.replace(/https?:\/\/[^\s]+/g, (u) => {
-      return `${req.protocol}://${req.get('host')}/segment?u=${encodeURIComponent(u)}`;
-    });
+    // D) proxy any absolute URLs so iPhone can fetch with CORS
+    const proxied = text.replace(/https?:\/\/[^\s]+/g, (u) =>
+      `${req.protocol}://${req.get('host')}/segment?u=${encodeURIComponent(u)}`
+    );
 
     res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+    res.setHeader('Cache-Control', 'no-store');
     res.send(proxied);
-  }catch(e){
-    console.error(e);
-    res.status(500).send('error');
+  } catch (e) {
+    console.error('playlist_error:', e?.message || e);
+    res.status(500).type('text').send(e?.message || 'error');
   }
 });
 
-// 2) Proxy segments and nested playlists with CORS enabled
+// 2) Proxy nested playlists and media segments
 app.get('/segment', async (req, res) => {
-  try{
+  try {
     const u = req.query.u;
-    if(!u) return res.status(400).send('missing u');
-    const upstream = await fetch(u);
-    if(!upstream.ok) return res.status(upstream.status).send('upstream error');
+    if (!u) return res.status(400).type('text').send('missing_u');
 
-    // Pass through headers
-    res.setHeader('Content-Type', upstream.headers.get('content-type') || 'application/octet-stream');
-    // For playlists, also rewrite inside bodies to keep proxying consistent
-    if((upstream.headers.get('content-type') || '').includes('application/vnd.apple.mpegurl')){
+    const upstream = await fetch(u);
+    if (!upstream.ok) throw new Error('upstream_' + upstream.status);
+
+    const ct = upstream.headers.get('content-type') || 'application/octet-stream';
+    res.setHeader('Content-Type', ct);
+    res.setHeader('Cache-Control', 'no-store');
+
+    if (ct.includes('application/vnd.apple.mpegurl')) {
       let text = await upstream.text();
-      // Remove ad dateranges again just in case
+      // Strip ad markers again (for variant/rendition playlists)
       text = text.split('\n').filter(line => {
-        if(line.startsWith('#EXT-X-DATERANGE')){
+        if (line.startsWith('#EXT-X-DATERANGE')) {
           const l = line.toLowerCase();
-          if(l.includes('stitched-ad') || l.includes('twitchad')) return false;
+          if (l.includes('stitched-ad') || l.includes('twitchad')) return false;
         }
         return true;
       }).join('\n');
-      // Rewrite absolute URLs through this proxy
+
+      // Rewrite relative + absolute URLs through our proxy
       const base = new URL(u);
-      text = text.replace(/^(?!#)(.*\.m3u8.*|.*\.ts.*|https?:\/\/[^\s]+)$/gm, (line) => {
-        line = line.trim();
-        if(line.startsWith('#') || line === '') return line;
-        // Make absolute
+      text = text.replace(/^(?!#).*$/gm, (line) => {
+        const s = line.trim();
+        if (!s || s.startsWith('#')) return s;
         let abs;
-        try{ abs = new URL(line, base).toString(); } catch { abs = line; }
+        try { abs = new URL(s, base).toString(); } catch { abs = s; }
         return `${req.protocol}://${req.get('host')}/segment?u=${encodeURIComponent(abs)}`;
       });
       return res.send(text);
-    }else{
-      // Stream binary segments
-      const buf = await upstream.arrayBuffer();
-      return res.end(Buffer.from(buf));
     }
-  }catch(e){
-    console.error(e);
-    res.status(500).send('error');
+
+    const buf = await upstream.arrayBuffer();
+    return res.end(Buffer.from(buf));
+  } catch (e) {
+    console.error('segment_error:', e?.message || e);
+    res.status(500).type('text').send(e?.message || 'error');
   }
 });
 
-// Serve static front-end (optional)
 app.use(express.static('public'));
 
 const PORT = process.env.PORT || 3000;
