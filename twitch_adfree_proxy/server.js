@@ -21,19 +21,72 @@ app.use((req, res, next) => {
 app.get('/health', (req, res) => res.type('text').send('ok'));
 
 // Helper: ask Twitch GraphQL for a playback token/signature
-async function getPlaybackToken(login) {
-  // Primary persisted query (commonly used by web player)
-  const body = [{
-    operationName: 'PlaybackAccessToken',
-    variables: { isLive: true, login, isVod: false, vodID: '', playerType: 'site' },
-    extensions: {
-      persistedQuery: {
-        version: 1,
-        // NOTE: Twitch can rotate this. This one works frequently; if it stops, we try a fallback below.
-        sha256Hash: '0828119ded1c1323e9f9f8f9ccf0c9d2d2cfa2b7066ad9e3f1ab3d0d7f6f6f0a'
+async function getPlaybackToken(login) async function getPlaybackToken(login) {
+  // Build a FULL GraphQL query (no persisted hash) — more stable than hashes.
+  const query = `
+    query PlaybackAccessToken(
+      $login: String!,
+      $isLive: Boolean!,
+      $vodID: ID!,
+      $isVod: Boolean!,
+      $playerType: String!
+    ) {
+      streamPlaybackAccessToken(
+        channelName: $login,
+        params: { platform: "web", playerBackend: "mediaplayer", playerType: $playerType }
+      ) @include(if: $isLive) {
+        value
+        signature
+        __typename
+      }
+      videoPlaybackAccessToken(
+        id: $vodID,
+        params: { platform: "web", playerBackend: "mediaplayer", playerType: $playerType }
+      ) @include(if: $isVod) {
+        value
+        signature
+        __typename
       }
     }
+  `;
+
+  const body = [{
+    operationName: 'PlaybackAccessToken',
+    variables: {
+      isLive: true,
+      login,
+      isVod: false,
+      vodID: '',
+      playerType: 'site'
+    },
+    query
   }];
+
+  const h = {
+    'Client-ID': CLIENT_ID,
+    'GQL-Client-Id': CLIENT_ID,
+    'Content-Type': 'application/json',
+    'Origin': 'https://www.twitch.tv',
+    'Referer': 'https://www.twitch.tv/'
+  };
+
+  const r = await fetch(TWITCH_GQL, {
+    method: 'POST',
+    headers: h,
+    body: JSON.stringify(body)
+  });
+
+  if (!r.ok) throw new Error('gql_failed_' + r.status);
+
+  const j = await r.json();
+  // Prefer live token node; fallback to video node just in case
+  const liveTok = j?.[0]?.data?.streamPlaybackAccessToken;
+  const vodTok  = j?.[0]?.data?.videoPlaybackAccessToken;
+  const tok = liveTok || vodTok;
+  if (!tok?.signature || !tok?.value) throw new Error('no_token');
+  return tok;
+}
+
 
   const h = {
   'Client-ID': CLIENT_ID,
