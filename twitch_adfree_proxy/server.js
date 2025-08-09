@@ -1,5 +1,5 @@
 // server.js — Node 18+ (ESM). Works on Render free tier.
-// Env vars (Render → Environment):
+// Env vars required in Render → Environment:
 //   TWITCH_CLIENT_ID
 //   TWITCH_CLIENT_SECRET
 
@@ -16,7 +16,7 @@ if (!CLIENT_ID || !CLIENT_SECRET) {
 
 const app = express();
 
-// CORS
+// --- CORS (so iPhone Safari can fetch from your domain)
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
@@ -27,7 +27,7 @@ app.use((req, res, next) => {
 
 app.get("/health", (req, res) => res.type("text").send("ok"));
 
-/** Cache app token in memory */
+// --- OAuth app token (cached in memory)
 let appToken = null;
 let appTokenExp = 0;
 
@@ -49,7 +49,7 @@ async function getAppToken() {
   return appToken;
 }
 
-// Ask Twitch for a playback token/signature using full GraphQL + OAuth
+// --- Fetch playback token/signature via full GraphQL + Bearer auth
 async function getPlaybackToken(login) {
   const query = `
     query PlaybackAccessToken(
@@ -76,7 +76,7 @@ async function getPlaybackToken(login) {
     query
   }];
 
-  const token = await getAppToken(); // NEW: get OAuth app token
+  const token = await getAppToken();
 
   const headers = {
     "Client-ID": CLIENT_ID,
@@ -84,8 +84,8 @@ async function getPlaybackToken(login) {
     "Content-Type": "application/json",
     "Origin": "https://www.twitch.tv",
     "Referer": "https://www.twitch.tv/",
-    // For GQL, Twitch accepts "OAuth <token>" (Helix uses "Bearer").
-    "Authorization": `OAuth ${token}`
+    // IMPORTANT: Bearer (not OAuth)
+    "Authorization": `Bearer ${token}`
   };
 
   const r = await fetch(TWITCH_GQL, { method: "POST", headers, body: JSON.stringify(body) });
@@ -99,7 +99,7 @@ async function getPlaybackToken(login) {
   return tok;
 }
 
-// Return a cleaned master playlist
+// --- Return a cleaned master playlist for a channel
 app.get("/playlist/:channel", async (req, res) => {
   try {
     const login = String(req.params.channel || "").toLowerCase();
@@ -142,7 +142,7 @@ app.get("/playlist/:channel", async (req, res) => {
   }
 });
 
-// Proxy nested playlists and segments
+// --- Proxy nested playlists and media segments
 app.get("/segment", async (req, res) => {
   try {
     const u = req.query.u;
@@ -157,6 +157,8 @@ app.get("/segment", async (req, res) => {
 
     if (ct.includes("application/vnd.apple.mpegurl")) {
       let text = await upstream.text();
+
+      // remove ad dateranges in child playlists too
       text = text.split("\n").filter(line => {
         if (line.startsWith("#EXT-X-DATERANGE")) {
           const l = line.toLowerCase();
@@ -186,6 +188,7 @@ app.get("/segment", async (req, res) => {
   }
 });
 
+// --- Serve static files (public/twitchhub_proxy.html)
 app.use(express.static("public"));
 
 const PORT = process.env.PORT || 3000;
