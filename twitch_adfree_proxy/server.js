@@ -1,17 +1,22 @@
 // server.js — Node 18+ (ESM). Works on Render free tier.
-// Env vars expected (Render → Environment):
-//   TWITCH_CLIENT_ID        = your client id
-//   (TWITCH_CLIENT_SECRET   = optional; not required here)
+// Env vars (Render → Environment):
+//   TWITCH_CLIENT_ID
+//   TWITCH_CLIENT_SECRET
 
 import express from "express";
 
 const TWITCH_GQL = "https://gql.twitch.tv/gql";
 const USHER = "https://usher.ttvnw.net/api/channel/hls";
-const CLIENT_ID = process.env.TWITCH_CLIENT_ID || "kimne78kx3ncx6brgo4mv6wki5h1ko";
+const CLIENT_ID = process.env.TWITCH_CLIENT_ID || "";
+const CLIENT_SECRET = process.env.TWITCH_CLIENT_SECRET || "";
+
+if (!CLIENT_ID || !CLIENT_SECRET) {
+  console.warn("⚠️ Missing TWITCH_CLIENT_ID or TWITCH_CLIENT_SECRET");
+}
 
 const app = express();
 
-// ---- CORS (so iPhone Safari can fetch from your domain)
+// CORS
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
@@ -22,7 +27,29 @@ app.use((req, res, next) => {
 
 app.get("/health", (req, res) => res.type("text").send("ok"));
 
-// ---- Ask Twitch for a playback token/signature using a full GQL query
+/** Cache app token in memory */
+let appToken = null;
+let appTokenExp = 0;
+
+async function getAppToken() {
+  const now = Math.floor(Date.now() / 1000);
+  if (appToken && now < appTokenExp - 60) return appToken;
+
+  const url =
+    `https://id.twitch.tv/oauth2/token` +
+    `?client_id=${encodeURIComponent(CLIENT_ID)}` +
+    `&client_secret=${encodeURIComponent(CLIENT_SECRET)}` +
+    `&grant_type=client_credentials`;
+
+  const r = await fetch(url, { method: "POST" });
+  if (!r.ok) throw new Error("oauth_failed_" + r.status);
+  const j = await r.json();
+  appToken = j.access_token;
+  appTokenExp = now + (j.expires_in || 3600);
+  return appToken;
+}
+
+// Ask Twitch for a playback token/signature using full GraphQL + OAuth
 async function getPlaybackToken(login) {
   const query = `
     query PlaybackAccessToken(
@@ -35,19 +62,11 @@ async function getPlaybackToken(login) {
       streamPlaybackAccessToken(
         channelName: $login,
         params: { platform: "web", playerBackend: "mediaplayer", playerType: $playerType }
-      ) @include(if: $isLive) {
-        value
-        signature
-        __typename
-      }
+      ) @include(if: $isLive) { value signature __typename }
       videoPlaybackAccessToken(
         id: $vodID,
         params: { platform: "web", playerBackend: "mediaplayer", playerType: $playerType }
-      ) @include(if: $isVod) {
-        value
-        signature
-        __typename
-      }
+      ) @include(if: $isVod) { value signature __typename }
     }
   `;
 
@@ -57,12 +76,16 @@ async function getPlaybackToken(login) {
     query
   }];
 
+  const token = await getAppToken(); // NEW: get OAuth app token
+
   const headers = {
     "Client-ID": CLIENT_ID,
     "GQL-Client-Id": CLIENT_ID,
     "Content-Type": "application/json",
     "Origin": "https://www.twitch.tv",
-    "Referer": "https://www.twitch.tv/"
+    "Referer": "https://www.twitch.tv/",
+    // For GQL, Twitch accepts "OAuth <token>" (Helix uses "Bearer").
+    "Authorization": `OAuth ${token}`
   };
 
   const r = await fetch(TWITCH_GQL, { method: "POST", headers, body: JSON.stringify(body) });
@@ -76,16 +99,14 @@ async function getPlaybackToken(login) {
   return tok;
 }
 
-// ---- Return a cleaned master playlist for a channel
+// Return a cleaned master playlist
 app.get("/playlist/:channel", async (req, res) => {
   try {
     const login = String(req.params.channel || "").toLowerCase();
     if (!/^[a-z0-9_]{1,25}$/.test(login)) return res.status(400).type("text").send("bad_channel");
 
-    // A) token + signature via GQL
     const tok = await getPlaybackToken(login);
 
-    // B) fetch Usher master m3u8
     const url = new URL(`${USHER}/${encodeURIComponent(login)}.m3u8`);
     url.searchParams.set("sig", tok.signature);
     url.searchParams.set("token", tok.value);
@@ -98,22 +119,17 @@ app.get("/playlist/:channel", async (req, res) => {
     const up = await fetch(url, { headers: { "Client-ID": CLIENT_ID } });
     if (!up.ok) throw new Error("usher_failed_" + up.status);
 
-    // Raw master playlist text
     let text = await up.text();
 
-    // C) Remove ad dateranges if present
-    text = text
-      .split("\n")
-      .filter(line => {
-        if (line.startsWith("#EXT-X-DATERANGE")) {
-          const l = line.toLowerCase();
-          if (l.includes("stitched-ad") || l.includes("twitchad")) return false;
-        }
-        return true;
-      })
-      .join("\n");
+    // strip ad dateranges
+    text = text.split("\n").filter(line => {
+      if (line.startsWith("#EXT-X-DATERANGE")) {
+        const l = line.toLowerCase();
+        if (l.includes("stitched-ad") || l.includes("twitchad")) return false;
+      }
+      return true;
+    }).join("\n");
 
-    // D) Proxy any absolute URLs so the browser can fetch with CORS
     const host = `${req.protocol}://${req.get("host")}`;
     const proxied = text.replace(/https?:\/\/[^\s]+/g, u => `${host}/segment?u=${encodeURIComponent(u)}`);
 
@@ -126,7 +142,7 @@ app.get("/playlist/:channel", async (req, res) => {
   }
 });
 
-// ---- Proxy nested playlists and media segments (and rewrite inside child playlists)
+// Proxy nested playlists and segments
 app.get("/segment", async (req, res) => {
   try {
     const u = req.query.u;
@@ -141,20 +157,14 @@ app.get("/segment", async (req, res) => {
 
     if (ct.includes("application/vnd.apple.mpegurl")) {
       let text = await upstream.text();
+      text = text.split("\n").filter(line => {
+        if (line.startsWith("#EXT-X-DATERANGE")) {
+          const l = line.toLowerCase();
+          if (l.includes("stitched-ad") || l.includes("twitchad")) return false;
+        }
+        return true;
+      }).join("\n");
 
-      // remove ad dateranges again for child playlists
-      text = text
-        .split("\n")
-        .filter(line => {
-          if (line.startsWith("#EXT-X-DATERANGE")) {
-            const l = line.toLowerCase();
-            if (l.includes("stitched-ad") || l.includes("twitchad")) return false;
-          }
-          return true;
-        })
-        .join("\n");
-
-      // rewrite relative & absolute URLs through our proxy
       const base = new URL(u);
       const host = `${req.protocol}://${req.get("host")}`;
       text = text.replace(/^(?!#).*$/gm, line => {
@@ -168,7 +178,6 @@ app.get("/segment", async (req, res) => {
       return res.send(text);
     }
 
-    // binary segment (TS, CMAF)
     const buf = await upstream.arrayBuffer();
     return res.end(Buffer.from(buf));
   } catch (e) {
@@ -177,7 +186,6 @@ app.get("/segment", async (req, res) => {
   }
 });
 
-// ---- Static files (e.g., public/twitchhub_proxy.html)
 app.use(express.static("public"));
 
 const PORT = process.env.PORT || 3000;
