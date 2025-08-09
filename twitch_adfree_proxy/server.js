@@ -35,7 +35,14 @@ async function getPlaybackToken(login) {
     }
   }];
 
-  const h = { 'Client-ID': CLIENT_ID, 'Content-Type': 'application/json' };
+  const h = {
+  'Client-ID': CLIENT_ID,
+  'GQL-Client-Id': CLIENT_ID,
+  'Content-Type': 'application/json',
+  'Origin': 'https://www.twitch.tv',
+  'Referer': 'https://www.twitch.tv/'
+};
+
   let r = await fetch(TWITCH_GQL, { method: 'POST', headers: h, body: JSON.stringify(body) });
 
   // If first attempt fails, try a slightly different playerType (fallback)
