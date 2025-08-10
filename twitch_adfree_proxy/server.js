@@ -1,12 +1,15 @@
 // server.js — Node 18+ (ESM). Works on Render free tier.
-// Env vars required in Render → Environment:
+// Required env vars in Render → Environment:
 //   TWITCH_CLIENT_ID
 //   TWITCH_CLIENT_SECRET
 
 import express from "express";
+import crypto from "crypto";
 
 const TWITCH_GQL = "https://gql.twitch.tv/gql";
+const TWITCH_INTEGRITY = "https://gql.twitch.tv/integrity";
 const USHER = "https://usher.ttvnw.net/api/channel/hls";
+
 const CLIENT_ID = process.env.TWITCH_CLIENT_ID || "";
 const CLIENT_SECRET = process.env.TWITCH_CLIENT_SECRET || "";
 
@@ -16,7 +19,7 @@ if (!CLIENT_ID || !CLIENT_SECRET) {
 
 const app = express();
 
-// --- CORS (so iPhone Safari can fetch from your domain)
+// ----- CORS
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
@@ -27,10 +30,17 @@ app.use((req, res, next) => {
 
 app.get("/health", (req, res) => res.type("text").send("ok"));
 
-// --- OAuth app token (cached in memory)
+// ----- Simple in-memory caches
 let appToken = null;
 let appTokenExp = 0;
 
+let integrityToken = null;
+let integrityExp = 0;
+
+// Stable per-process device id
+const DEVICE_ID = crypto.randomUUID();
+
+// Get OAuth app token
 async function getAppToken() {
   const now = Math.floor(Date.now() / 1000);
   if (appToken && now < appTokenExp - 60) return appToken;
@@ -49,7 +59,35 @@ async function getAppToken() {
   return appToken;
 }
 
-// --- Fetch playback token/signature via full GraphQL + Bearer auth
+// Get Client-Integrity token (required by GQL in many regions)
+async function getIntegrityToken() {
+  const now = Math.floor(Date.now() / 1000);
+  if (integrityToken && now < integrityExp - 60) return integrityToken;
+
+  const bearer = await getAppToken();
+  const r = await fetch(TWITCH_INTEGRITY, {
+    method: "POST",
+    headers: {
+      "Client-ID": CLIENT_ID,
+      "Authorization": `Bearer ${bearer}`,
+      "X-Device-Id": DEVICE_ID,
+      "Content-Type": "application/json",
+      "Origin": "https://www.twitch.tv",
+      "Referer": "https://www.twitch.tv/"
+    },
+    body: "{}"
+  });
+
+  if (!r.ok) throw new Error("integrity_failed_" + r.status);
+  const j = await r.json();
+  // response has: token, expiration
+  integrityToken = j.token;
+  // if expiration provided (seconds), honor it; else 10 minutes
+  integrityExp = now + (j.expiration || 600);
+  return integrityToken;
+}
+
+// Ask Twitch for a playback token/signature via full GQL + Bearer + Integrity + Device
 async function getPlaybackToken(login) {
   const query = `
     query PlaybackAccessToken(
@@ -76,16 +114,18 @@ async function getPlaybackToken(login) {
     query
   }];
 
-  const token = await getAppToken();
+  const bearer = await getAppToken();
+  const integrity = await getIntegrityToken();
 
   const headers = {
     "Client-ID": CLIENT_ID,
     "GQL-Client-Id": CLIENT_ID,
+    "Authorization": `Bearer ${bearer}`,
+    "Client-Integrity": integrity,
+    "X-Device-Id": DEVICE_ID,
     "Content-Type": "application/json",
     "Origin": "https://www.twitch.tv",
-    "Referer": "https://www.twitch.tv/",
-    // IMPORTANT: Bearer (not OAuth)
-    "Authorization": `Bearer ${token}`
+    "Referer": "https://www.twitch.tv/"
   };
 
   const r = await fetch(TWITCH_GQL, { method: "POST", headers, body: JSON.stringify(body) });
@@ -99,7 +139,7 @@ async function getPlaybackToken(login) {
   return tok;
 }
 
-// --- Return a cleaned master playlist for a channel
+// Return a cleaned master playlist
 app.get("/playlist/:channel", async (req, res) => {
   try {
     const login = String(req.params.channel || "").toLowerCase();
@@ -116,12 +156,12 @@ app.get("/playlist/:channel", async (req, res) => {
     url.searchParams.set("p", String(Math.floor(Math.random() * 1e7)));
     url.searchParams.set("client_id", CLIENT_ID);
 
-    const up = await fetch(url, { headers: { "Client-ID": CLIENT_ID } });
+    const up = await fetch(url, { headers: { "Client-ID": CLIENT_ID, "X-Device-Id": DEVICE_ID } });
     if (!up.ok) throw new Error("usher_failed_" + up.status);
 
     let text = await up.text();
 
-    // strip ad dateranges
+    // strip common ad dateranges
     text = text.split("\n").filter(line => {
       if (line.startsWith("#EXT-X-DATERANGE")) {
         const l = line.toLowerCase();
@@ -142,13 +182,13 @@ app.get("/playlist/:channel", async (req, res) => {
   }
 });
 
-// --- Proxy nested playlists and media segments
+// Proxy nested playlists and segments
 app.get("/segment", async (req, res) => {
   try {
     const u = req.query.u;
     if (!u) return res.status(400).type("text").send("missing_u");
 
-    const upstream = await fetch(u);
+    const upstream = await fetch(u, { headers: { "X-Device-Id": DEVICE_ID } });
     if (!upstream.ok) throw new Error("upstream_" + upstream.status);
 
     const ct = upstream.headers.get("content-type") || "application/octet-stream";
@@ -188,7 +228,6 @@ app.get("/segment", async (req, res) => {
   }
 });
 
-// --- Serve static files (public/twitchhub_proxy.html)
 app.use(express.static("public"));
 
 const PORT = process.env.PORT || 3000;
